@@ -58,7 +58,6 @@ public class Message {
 
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             DataOutputStream out = new DataOutputStream(bos);
-
             out.writeInt(magicBytes.length);
             out.write(magicBytes);
             out.writeInt(version);
@@ -70,7 +69,6 @@ public class Message {
             out.writeInt(payloadBytes.length);
             out.write(payloadBytes);
             out.flush();
-
             return bos.toByteArray();
         } catch (IOException e) {
             throw new IllegalStateException("Failed to serialize message", e);
@@ -89,7 +87,6 @@ public class Message {
         try {
             DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
             Message message = new Message();
-
             message.magic = new String(readBoundedField(in, MAX_FIELD_BYTES), StandardCharsets.UTF_8);
             message.version = in.readInt();
             message.messageType = new String(readBoundedField(in, MAX_FIELD_BYTES), StandardCharsets.UTF_8);
@@ -97,7 +94,6 @@ public class Message {
             message.timestamp = in.readLong();
             message.payload = new String(readBoundedField(in, MAX_PAYLOAD_BYTES), StandardCharsets.UTF_8);
             message.validate();
-
             return message;
         } catch (IOException e) {
             throw new IllegalArgumentException("Failed to unpack message", e);
@@ -133,7 +129,7 @@ public class Message {
     }
 
     public void validate() {
-        if (magic == null || !"CSM218".equals(magic)) {
+        if (!"CSM218".equals(magic)) {
             throw new IllegalArgumentException("Invalid magic");
         }
         if (version < 1) {

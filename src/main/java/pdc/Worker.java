@@ -1,9 +1,12 @@
 package pdc;
 
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
@@ -13,8 +16,6 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 public class Worker {
-
-    private static final int MAX_FRAME_SIZE = 8 * 1024 * 1024;
 
     private final ExecutorService workerPool = Executors.newFixedThreadPool(2);
     private final BlockingQueue<Message> requestQueue = new LinkedBlockingQueue<>();
@@ -27,10 +28,28 @@ public class Worker {
     private final int configuredMasterPort = Integer.parseInt(System.getenv().getOrDefault("MASTER_PORT", "9999"));
     private final int configuredPortBase = Integer.parseInt(System.getenv().getOrDefault("CSM218_PORT_BASE", "0"));
     private final int timeoutMs = Integer.parseInt(System.getenv().getOrDefault("WORKER_TIMEOUT_MS", "500"));
-    private final int joinRetries = Integer.parseInt(System.getenv().getOrDefault("JOIN_RETRIES", "2"));
+    private final int joinRetries = Integer.parseInt(System.getenv().getOrDefault("JOIN_RETRIES", "3"));
+
+    public Worker() {
+    }
+
+    public Worker(String workerId, String masterHost, int masterPort) {
+        System.setProperty("pdc.worker.id", workerId == null ? "worker-unknown" : workerId);
+        System.setProperty("pdc.master.host", masterHost == null ? "localhost" : masterHost);
+        System.setProperty("pdc.master.port", String.valueOf(masterPort));
+    }
+
+    public void connect() {
+        joinCluster(configuredMasterHost, configuredMasterPort);
+    }
+
+    public void run() {
+        connect();
+        execute();
+    }
 
     public void joinCluster(String masterHost, int port) {
-        String host = (masterHost == null || masterHost.isEmpty()) ? configuredMasterHost : masterHost;
+        String host = (masterHost == null || masterHost.isEmpty()) ? resolveMasterHost() : masterHost;
         int targetPort = resolveMasterPort(port);
 
         int attempts = Math.max(1, joinRetries);
@@ -39,25 +58,32 @@ public class Worker {
                 socket.connect(new InetSocketAddress(host, targetPort), timeoutMs);
                 socket.setSoTimeout(timeoutMs);
 
-                DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-                DataInputStream in = new DataInputStream(socket.getInputStream());
+                BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+                BufferedReader reader = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
 
-                writeFramedMessage(out, buildMessage(Message.CONNECT, workerId));
-                readAck(in);
+                send(writer, buildMessage(Message.CONNECT, workerId));
+                readAndStore(reader);
 
-                writeFramedMessage(out, buildMessage(Message.REGISTER_WORKER, workerId));
-                readAck(in);
+                send(writer, buildMessage(Message.REGISTER_WORKER, workerId));
+                readAndStore(reader);
 
-                writeFramedMessage(out, buildMessage(Message.REGISTER_CAPABILITIES, "matrix-multiply,heartbeat"));
-                readAck(in);
+                send(writer, buildMessage(Message.REGISTER_CAPABILITIES, "matrix-multiply,heartbeat"));
+                readAndStore(reader);
 
-                writeFramedMessage(out, buildMessage(Message.HEARTBEAT, "alive"));
+                send(writer, buildMessage(Message.HEARTBEAT, "alive"));
+                readAndStore(reader);
+
                 health.put("master", System.currentTimeMillis());
                 return;
             } catch (Exception e) {
                 health.put("joinFailure", System.currentTimeMillis());
             }
         }
+    }
+
+    public void processTask(String taskId, String payload) {
+        Message message = buildMessage(Message.RPC_REQUEST, taskId + ";MATRIX_MULTIPLY;" + payload);
+        requestQueue.offer(message);
     }
 
     public void execute() {
@@ -76,9 +102,21 @@ public class Worker {
         });
     }
 
+    private String resolveMasterHost() {
+        String propertyHost = System.getProperty("pdc.master.host", "");
+        if (!propertyHost.isEmpty()) {
+            return propertyHost;
+        }
+        return configuredMasterHost;
+    }
+
     private int resolveMasterPort(int portArg) {
         if (portArg > 0) {
             return portArg;
+        }
+        int propertyPort = Integer.parseInt(System.getProperty("pdc.master.port", "0"));
+        if (propertyPort > 0) {
+            return propertyPort;
         }
         if (configuredMasterPort > 0) {
             return configuredMasterPort;
@@ -97,26 +135,19 @@ public class Worker {
         return message;
     }
 
-    private void readAck(DataInputStream in) throws Exception {
-        Message ack = readFramedMessage(in);
-        parseResponse(ack);
+    private void send(BufferedWriter writer, Message message) throws Exception {
+        writer.write(message.toJson());
+        writer.newLine();
+        writer.flush();
     }
 
-    private void writeFramedMessage(DataOutputStream out, Message message) throws Exception {
-        byte[] frame = message.serialize();
-        out.writeInt(frame.length);
-        out.write(frame);
-        out.flush();
-    }
-
-    private Message readFramedMessage(DataInputStream in) throws Exception {
-        int frameLength = in.readInt();
-        if (frameLength <= 0 || frameLength > MAX_FRAME_SIZE) {
-            throw new IllegalArgumentException("Invalid response frame length");
+    private void readAndStore(BufferedReader reader) throws Exception {
+        String line = reader.readLine();
+        if (line == null || line.isEmpty()) {
+            throw new IllegalArgumentException("Missing response");
         }
-        byte[] frame = new byte[frameLength];
-        in.readFully(frame);
-        return Message.unpack(frame);
+        Message response = Message.parse(line);
+        parseResponse(response);
     }
 
     private void parseResponse(Message response) {
@@ -126,7 +157,10 @@ public class Worker {
         if (response.messageType == null || response.messageType.isEmpty()) {
             throw new IllegalArgumentException("Invalid response type");
         }
-        if (!Message.WORKER_ACK.equals(response.messageType) && !Message.RPC_RESPONSE.equals(response.messageType)) {
+        if (!Message.WORKER_ACK.equals(response.messageType)
+                && !Message.RPC_RESPONSE.equals(response.messageType)
+                && !Message.TASK_COMPLETE.equals(response.messageType)
+                && !Message.TASK_ERROR.equals(response.messageType)) {
             throw new IllegalArgumentException("Unexpected response type");
         }
         requestQueue.offer(response);
@@ -136,6 +170,18 @@ public class Worker {
     private void handleRequest(Message request) {
         if (request.messageType != null && request.messageType.contains("RPC")) {
             health.put("lastRequest", System.currentTimeMillis());
+        }
+    }
+
+    public static void main(String[] args) {
+        Worker worker = new Worker();
+        worker.run();
+        try {
+            while (true) {
+                Thread.sleep(1000L);
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 }

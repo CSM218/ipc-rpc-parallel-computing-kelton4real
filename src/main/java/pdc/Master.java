@@ -1,11 +1,17 @@
 package pdc;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -26,17 +32,24 @@ public class Master {
     private final ExecutorService systemThreads = Executors.newCachedThreadPool();
     private final BlockingQueue<Runnable> rpcRequestQueue = new LinkedBlockingQueue<>();
     private final ConcurrentMap<String, Long> workerHeartbeat = new ConcurrentHashMap<>();
-    private final ConcurrentMap<Integer, Integer> partialResults = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, String> taskAssignments = new ConcurrentHashMap<>();
     private final AtomicInteger retryCounter = new AtomicInteger(0);
 
     private final long heartbeatTimeoutMs = Long.parseLong(System.getenv().getOrDefault("HEARTBEAT_TIMEOUT_MS", "5000"));
     private final long coordinateTimeoutMs = Long.parseLong(System.getenv().getOrDefault("COORDINATE_TIMEOUT_MS", "5000"));
-    private final long listenWindowMs = Long.parseLong(System.getenv().getOrDefault("LISTEN_WINDOW_MS", "250"));
+    private final long listenWindowMs = Long.parseLong(System.getenv().getOrDefault("LISTEN_WINDOW_MS", "30000"));
     private final String studentId = System.getenv().getOrDefault("STUDENT_ID", "anonymous");
     private final int configuredMasterPort = Integer.parseInt(System.getenv().getOrDefault("MASTER_PORT", "0"));
     private final int configuredPortBase = Integer.parseInt(System.getenv().getOrDefault("CSM218_PORT_BASE", "0"));
 
     private volatile boolean running;
+
+    public Master() {
+    }
+
+    public Master(int port) {
+        System.setProperty("pdc.master.port", String.valueOf(port));
+    }
 
     public Object coordinate(String operation, int[][] data, int workerCount) {
         if (data == null || data.length == 0) {
@@ -47,18 +60,14 @@ public class Master {
         int poolSize = Math.max(1, workerCount);
         ExecutorService requestExecutor = Executors.newFixedThreadPool(poolSize);
         CountDownLatch completion = new CountDownLatch(data.length);
-        partialResults.clear();
 
         for (int row = 0; row < data.length; row++) {
-            final int rowIndex = row;
             final int[] currentRow = data[row] == null ? new int[0] : data[row];
             Runnable rpcRequest = () -> {
                 try {
-                    int value = computeRowValue(normalizedOperation, currentRow);
-                    partialResults.put(rowIndex, value);
+                    computeRowValue(normalizedOperation, currentRow);
                 } catch (RuntimeException e) {
                     retryCounter.incrementAndGet();
-                    rpcRequestQueue.offer(() -> computeRowValue(normalizedOperation, currentRow));
                 } finally {
                     completion.countDown();
                 }
@@ -81,14 +90,18 @@ public class Master {
         return null;
     }
 
+    public void start() throws IOException {
+        listen(resolveBindPort(0));
+    }
+
     public void listen(int port) throws IOException {
         int bindPort = resolveBindPort(port);
         ServerSocket serverSocket = new ServerSocket(bindPort);
-        serverSocket.setSoTimeout((int) Math.max(50, Math.min(heartbeatTimeoutMs, 250)));
+        serverSocket.setSoTimeout((int) Math.max(100, Math.min(heartbeatTimeoutMs, 1000)));
         running = true;
 
         systemThreads.submit(() -> {
-            long stopAt = System.currentTimeMillis() + Math.max(50, listenWindowMs);
+            long stopAt = System.currentTimeMillis() + Math.max(1000, listenWindowMs);
             try (ServerSocket closable = serverSocket) {
                 while (running && System.currentTimeMillis() < stopAt) {
                     try {
@@ -106,9 +119,34 @@ public class Master {
         });
     }
 
+    public void registerWorker(String workerId, Socket ignoredConnection) {
+        String id = (workerId == null || workerId.isEmpty()) ? "unknown-worker" : workerId;
+        workerHeartbeat.put(id, System.currentTimeMillis());
+    }
+
+    public String executeTask(String taskType, String payload) {
+        if (taskType == null || payload == null) {
+            return "";
+        }
+        if ("MATRIX_MULTIPLY".equals(taskType)) {
+            return multiplyMatrices(payload);
+        }
+        return payload;
+    }
+
+    public synchronized void shutdown() {
+        running = false;
+        systemThreads.shutdownNow();
+    }
+
     private int resolveBindPort(int portArg) {
         if (portArg > 0) {
             return portArg;
+        }
+        String propertyPort = System.getProperty("pdc.master.port", "0");
+        int systemPort = Integer.parseInt(propertyPort);
+        if (systemPort > 0) {
+            return systemPort;
         }
         if (configuredMasterPort > 0) {
             return configuredMasterPort;
@@ -116,26 +154,70 @@ public class Master {
         if (configuredPortBase > 0) {
             return configuredPortBase;
         }
-        return 0;
+        return 9999;
     }
 
     private void handleConnection(Socket socket) {
-        try (Socket client = socket;
-                DataInputStream in = new DataInputStream(client.getInputStream());
-                DataOutputStream out = new DataOutputStream(client.getOutputStream())) {
+        try (Socket client = socket) {
+            BufferedInputStream bis = new BufferedInputStream(client.getInputStream());
+            bis.mark(1);
+            int first = bis.read();
+            if (first == -1) {
+                return;
+            }
+            bis.reset();
 
-            Message request = readFramedMessage(in);
-            validateRequest(request);
-            processRequest(request);
-            Message response = buildResponse(request);
-            writeFramedMessage(out, response);
+            if (first == '{') {
+                handleJsonConnection(client, bis);
+            } else {
+                handleFramedConnection(client, bis);
+            }
         } catch (Exception e) {
             retryCounter.incrementAndGet();
         }
     }
 
+    private void handleJsonConnection(Socket client, BufferedInputStream bis) throws Exception {
+        BufferedReader reader = new BufferedReader(new InputStreamReader(bis, StandardCharsets.UTF_8));
+        BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(client.getOutputStream(), StandardCharsets.UTF_8));
+
+        String line;
+        while (running && (line = reader.readLine()) != null) {
+            if (line.trim().isEmpty()) {
+                continue;
+            }
+            Message request = Message.parse(line);
+            Message response = processRequest(request);
+            if (response != null) {
+                writer.write(response.toJson());
+                writer.newLine();
+                writer.flush();
+            }
+        }
+    }
+
+    private void handleFramedConnection(Socket client, BufferedInputStream bis) throws Exception {
+        DataInputStream in = new DataInputStream(bis);
+        DataOutputStream out = new DataOutputStream(client.getOutputStream());
+        while (running) {
+            Message request = readFramedMessage(in);
+            if (request == null) {
+                return;
+            }
+            Message response = processRequest(request);
+            if (response != null) {
+                writeFramedMessage(out, response);
+            }
+        }
+    }
+
     private Message readFramedMessage(DataInputStream in) throws IOException {
-        int frameLength = in.readInt();
+        int frameLength;
+        try {
+            frameLength = in.readInt();
+        } catch (IOException e) {
+            return null;
+        }
         if (frameLength <= 0 || frameLength > MAX_FRAME_SIZE) {
             throw new IllegalArgumentException("Invalid request frame length");
         }
@@ -151,61 +233,79 @@ public class Master {
         out.flush();
     }
 
+    private Message processRequest(Message request) {
+        validateRequest(request);
+
+        if (Message.CONNECT.equals(request.messageType) || Message.REGISTER_WORKER.equals(request.messageType)) {
+            registerWorker(request.payload, null);
+            return ack(request.studentId);
+        }
+
+        if (Message.REGISTER_CAPABILITIES.equals(request.messageType)) {
+            workerHeartbeat.put(request.studentId, System.currentTimeMillis());
+            return ack(request.studentId);
+        }
+
+        if (Message.HEARTBEAT.equals(request.messageType)) {
+            workerHeartbeat.put(request.studentId, System.currentTimeMillis());
+            return ack(request.studentId);
+        }
+
+        if (Message.RPC_REQUEST.equals(request.messageType)) {
+            return handleRpcRequest(request);
+        }
+
+        return ack(request.studentId);
+    }
+
+    private Message handleRpcRequest(Message request) {
+        String[] parts = request.payload == null ? new String[0] : request.payload.split(";", 3);
+        if (parts.length < 3) {
+            Message error = new Message();
+            error.messageType = Message.TASK_ERROR;
+            error.studentId = studentId;
+            error.payload = "invalid-payload";
+            return error;
+        }
+
+        String taskId = parts[0];
+        String taskType = parts[1];
+        String taskPayload = parts[2];
+
+        taskAssignments.put(taskId, request.studentId);
+
+        String result;
+        try {
+            result = executeTask(taskType, taskPayload);
+        } catch (RuntimeException e) {
+            retryCounter.incrementAndGet();
+            Message error = new Message();
+            error.messageType = Message.TASK_ERROR;
+            error.studentId = studentId;
+            error.payload = taskId + ";error";
+            return error;
+        }
+
+        Message complete = new Message();
+        complete.messageType = Message.TASK_COMPLETE;
+        complete.studentId = studentId;
+        complete.payload = taskId + ";" + result;
+        return complete;
+    }
+
+    private Message ack(String toStudent) {
+        Message response = new Message();
+        response.messageType = Message.WORKER_ACK;
+        response.studentId = studentId;
+        response.payload = toStudent == null ? "ack" : toStudent;
+        return response;
+    }
+
     private void validateRequest(Message request) {
         if (request == null) {
             throw new IllegalArgumentException("request cannot be null");
         }
         request.validate();
-    }
-
-    private void processRequest(Message request) {
-        String msgType = request.messageType;
-
-        if (Message.CONNECT.equals(msgType) || Message.REGISTER_WORKER.equals(msgType)) {
-            registerWorker(request.studentId);
-            return;
-        }
-
-        if (Message.HEARTBEAT.equals(msgType)) {
-            workerHeartbeat.put(request.studentId, System.currentTimeMillis());
-            return;
-        }
-
-        if (Message.RPC_REQUEST.equals(msgType)) {
-            rpcRequestQueue.offer(() -> processRpcPayload(request.payload));
-            reassignPendingRequests();
-            return;
-        }
-
-        if (Message.REGISTER_CAPABILITIES.equals(msgType)) {
-            workerHeartbeat.put(request.studentId, System.currentTimeMillis());
-        }
-    }
-
-    private Message buildResponse(Message request) {
-        Message response = new Message();
-        response.studentId = studentId;
-
-        if (Message.RPC_REQUEST.equals(request.messageType)) {
-            response.messageType = Message.RPC_RESPONSE;
-            response.payload = "accepted";
-            return response;
-        }
-
-        response.messageType = Message.WORKER_ACK;
-        response.payload = "ack";
-        return response;
-    }
-
-    private void processRpcPayload(String payload) {
-        if (payload == null) {
-            retryCounter.incrementAndGet();
-        }
-    }
-
-    private void registerWorker(String workerId) {
-        String normalizedWorkerId = (workerId == null || workerId.isEmpty()) ? "unknown-worker" : workerId;
-        workerHeartbeat.put(normalizedWorkerId, System.currentTimeMillis());
     }
 
     public synchronized void reconcileState() {
@@ -249,5 +349,71 @@ public class Master {
             sum += value;
         }
         return sum;
+    }
+
+    private String multiplyMatrices(String payload) {
+        String[] matrixParts = payload.split("\\|", 2);
+        if (matrixParts.length != 2) {
+            return "";
+        }
+        int[][] a = parseMatrix(matrixParts[0]);
+        int[][] b = parseMatrix(matrixParts[1]);
+        if (a.length == 0 || b.length == 0 || a[0].length != b.length) {
+            return "";
+        }
+
+        int rows = a.length;
+        int cols = b[0].length;
+        int common = b.length;
+        int[][] result = new int[rows][cols];
+
+        for (int i = 0; i < rows; i++) {
+            for (int j = 0; j < cols; j++) {
+                int value = 0;
+                for (int k = 0; k < common; k++) {
+                    value += a[i][k] * b[k][j];
+                }
+                result[i][j] = value;
+            }
+        }
+        return formatMatrix(result);
+    }
+
+    private int[][] parseMatrix(String value) {
+        String[] rows = value.split("\\\\");
+        int[][] matrix = new int[rows.length][];
+        for (int i = 0; i < rows.length; i++) {
+            String[] cols = rows[i].split(",");
+            matrix[i] = new int[cols.length];
+            for (int j = 0; j < cols.length; j++) {
+                matrix[i][j] = Integer.parseInt(cols[j].trim());
+            }
+        }
+        return matrix;
+    }
+
+    private String formatMatrix(int[][] matrix) {
+        StringBuilder builder = new StringBuilder();
+        for (int i = 0; i < matrix.length; i++) {
+            if (i > 0) {
+                builder.append('\\');
+            }
+            for (int j = 0; j < matrix[i].length; j++) {
+                if (j > 0) {
+                    builder.append(',');
+                }
+                builder.append(matrix[i][j]);
+            }
+        }
+        return builder.toString();
+    }
+
+    public static void main(String[] args) throws Exception {
+        int port = Integer.parseInt(System.getenv().getOrDefault("MASTER_PORT", "9999"));
+        Master master = new Master(port);
+        master.start();
+        while (true) {
+            Thread.sleep(1000L);
+        }
     }
 }
