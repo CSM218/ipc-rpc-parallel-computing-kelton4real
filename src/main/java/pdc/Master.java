@@ -23,9 +23,9 @@ public class Master {
     private final Map<String, Long> workerHeartbeat = new ConcurrentHashMap<>();
     private final AtomicInteger retryCounter = new AtomicInteger(0);
 
-    private final long heartbeatTimeoutMs = 5000L;
-    private final String studentId = "anonymous";
-    private final int defaultPort = 0;
+    private final long heartbeatTimeoutMs = Long.parseLong(System.getenv().getOrDefault("HEARTBEAT_TIMEOUT_MS", "5000"));
+    private final String studentId = System.getenv().getOrDefault("STUDENT_ID", "anonymous");
+    private final int defaultPort = Integer.parseInt(System.getenv().getOrDefault("PORT", "0"));
 
     private volatile boolean running;
 

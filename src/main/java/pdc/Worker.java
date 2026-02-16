@@ -19,12 +19,12 @@ public class Worker {
     private final ConcurrentHashMap<String, Long> health = new ConcurrentHashMap<>();
     private final AtomicBoolean running = new AtomicBoolean(true);
 
-    private final String studentId = "anonymous";
-    private final int timeoutMs = 500;
+    private final String studentId = System.getenv().getOrDefault("STUDENT_ID", "anonymous");
+    private final int timeoutMs = Integer.parseInt(System.getenv().getOrDefault("WORKER_TIMEOUT_MS", "500"));
 
     public void joinCluster(String masterHost, int port) {
         String host = masterHost == null || masterHost.isEmpty() ? "localhost" : masterHost;
-        int targetPort = port > 0 ? port : 9999;
+        int targetPort = port > 0 ? port : Integer.parseInt(System.getenv().getOrDefault("PORT", "9999"));
 
         try (Socket socket = new Socket()) {
             socket.connect(new InetSocketAddress(host, targetPort), timeoutMs);
