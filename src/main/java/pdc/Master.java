@@ -6,7 +6,6 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.SocketTimeoutException;
-import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -29,17 +28,15 @@ public class Master {
     private final ConcurrentMap<String, Long> workerHeartbeat = new ConcurrentHashMap<>();
     private final ConcurrentMap<Integer, Integer> partialResults = new ConcurrentHashMap<>();
     private final AtomicInteger retryCounter = new AtomicInteger(0);
-    private final AtomicInteger completedTasks = new AtomicInteger(0);
-    private final AtomicInteger lastCoordinateValue = new AtomicInteger(0);
 
     private final long heartbeatTimeoutMs = Long.parseLong(System.getenv().getOrDefault("HEARTBEAT_TIMEOUT_MS", "5000"));
     private final long coordinateTimeoutMs = Long.parseLong(System.getenv().getOrDefault("COORDINATE_TIMEOUT_MS", "5000"));
     private final long listenWindowMs = Long.parseLong(System.getenv().getOrDefault("LISTEN_WINDOW_MS", "250"));
     private final String studentId = System.getenv().getOrDefault("STUDENT_ID", "anonymous");
-    private final int defaultPort = Integer.parseInt(System.getenv().getOrDefault("PORT", "0"));
+    private final int configuredMasterPort = Integer.parseInt(System.getenv().getOrDefault("MASTER_PORT", "0"));
+    private final int configuredPortBase = Integer.parseInt(System.getenv().getOrDefault("CSM218_PORT_BASE", "0"));
 
     private volatile boolean running;
-    private volatile ServerSocket listenerSocket;
 
     public Object coordinate(String operation, int[][] data, int workerCount) {
         if (data == null || data.length == 0) {
@@ -50,7 +47,6 @@ public class Master {
         int poolSize = Math.max(1, workerCount);
         ExecutorService requestExecutor = Executors.newFixedThreadPool(poolSize);
         CountDownLatch completion = new CountDownLatch(data.length);
-
         partialResults.clear();
 
         for (int row = 0; row < data.length; row++) {
@@ -58,12 +54,11 @@ public class Master {
             final int[] currentRow = data[row] == null ? new int[0] : data[row];
             Runnable rpcRequest = () -> {
                 try {
-                    int rowValue = computeRowValue(normalizedOperation, currentRow);
-                    partialResults.put(rowIndex, rowValue);
-                    completedTasks.incrementAndGet();
+                    int value = computeRowValue(normalizedOperation, currentRow);
+                    partialResults.put(rowIndex, value);
                 } catch (RuntimeException e) {
                     retryCounter.incrementAndGet();
-                    reassign(rpcRequestQueue);
+                    rpcRequestQueue.offer(() -> computeRowValue(normalizedOperation, currentRow));
                 } finally {
                     completion.countDown();
                 }
@@ -72,72 +67,67 @@ public class Master {
             requestExecutor.submit(rpcRequest);
         }
 
-        boolean completed;
         try {
-            completed = completion.await(coordinateTimeoutMs, TimeUnit.MILLISECONDS);
+            if (!completion.await(coordinateTimeoutMs, TimeUnit.MILLISECONDS)) {
+                retryCounter.incrementAndGet();
+                reassignPendingRequests();
+            }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             retryCounter.incrementAndGet();
-            completed = false;
-        }
-
-        if (!completed) {
-            retryCounter.incrementAndGet();
-            reassignPendingRequests();
         }
 
         requestExecutor.shutdown();
-
-        int aggregate = 0;
-        for (Integer value : partialResults.values()) {
-            aggregate += value;
-        }
-        lastCoordinateValue.set(aggregate);
         return null;
     }
 
     public void listen(int port) throws IOException {
-        int bindPort = port > 0 ? port : defaultPort;
+        int bindPort = resolveBindPort(port);
         ServerSocket serverSocket = new ServerSocket(bindPort);
         serverSocket.setSoTimeout((int) Math.max(50, Math.min(heartbeatTimeoutMs, 250)));
-        listenerSocket = serverSocket;
         running = true;
 
-        systemThreads.submit(() -> acceptLoop(serverSocket));
-    }
-
-    private void acceptLoop(ServerSocket serverSocket) {
-        long stopAt = System.currentTimeMillis() + Math.max(50, listenWindowMs);
-        try (ServerSocket closable = serverSocket) {
-            while (running && System.currentTimeMillis() < stopAt) {
-                try {
-                    Socket socket = closable.accept();
-                    systemThreads.submit(() -> handleRpcRequest(socket));
-                } catch (SocketTimeoutException e) {
-                    reconcileState();
+        systemThreads.submit(() -> {
+            long stopAt = System.currentTimeMillis() + Math.max(50, listenWindowMs);
+            try (ServerSocket closable = serverSocket) {
+                while (running && System.currentTimeMillis() < stopAt) {
+                    try {
+                        Socket socket = closable.accept();
+                        systemThreads.submit(() -> handleConnection(socket));
+                    } catch (SocketTimeoutException e) {
+                        reconcileState();
+                    }
                 }
+            } catch (IOException e) {
+                retryCounter.incrementAndGet();
+            } finally {
+                running = false;
             }
-        } catch (IOException e) {
-            retryCounter.incrementAndGet();
-        } finally {
-            running = false;
-            listenerSocket = null;
-        }
+        });
     }
 
-    private void handleRpcRequest(Socket socket) {
+    private int resolveBindPort(int portArg) {
+        if (portArg > 0) {
+            return portArg;
+        }
+        if (configuredMasterPort > 0) {
+            return configuredMasterPort;
+        }
+        if (configuredPortBase > 0) {
+            return configuredPortBase;
+        }
+        return 0;
+    }
+
+    private void handleConnection(Socket socket) {
         try (Socket client = socket;
                 DataInputStream in = new DataInputStream(client.getInputStream());
                 DataOutputStream out = new DataOutputStream(client.getOutputStream())) {
 
             Message request = readFramedMessage(in);
-            validateRpcRequest(request);
-            registerHeartbeat(request.studentId);
-
-            Message response = new Message();
-            response.messageType = "RPC_ACK";
-            response.studentId = studentId;
-            response.payload = ("ack:" + request.messageType).getBytes(StandardCharsets.UTF_8);
+            validateRequest(request);
+            processRequest(request);
+            Message response = buildResponse(request);
             writeFramedMessage(out, response);
         } catch (Exception e) {
             retryCounter.incrementAndGet();
@@ -161,36 +151,61 @@ public class Master {
         out.flush();
     }
 
-    private int computeRowValue(String operation, int[] row) {
-        if ("BLOCK_MULTIPLY".equals(operation)) {
-            int product = 1;
-            for (int value : row) {
-                product *= value;
-            }
-            return product;
-        }
-        int sum = 0;
-        for (int value : row) {
-            sum += value;
-        }
-        return sum;
-    }
-
-    private void validateRpcRequest(Message request) {
+    private void validateRequest(Message request) {
         if (request == null) {
             throw new IllegalArgumentException("request cannot be null");
         }
-        if (request.messageType == null || request.messageType.isEmpty()) {
-            throw new IllegalArgumentException("request messageType missing");
+        request.validate();
+    }
+
+    private void processRequest(Message request) {
+        String msgType = request.messageType;
+
+        if (Message.CONNECT.equals(msgType) || Message.REGISTER_WORKER.equals(msgType)) {
+            registerWorker(request.studentId);
+            return;
         }
-        if (request.studentId == null || request.studentId.isEmpty()) {
-            throw new IllegalArgumentException("request studentId missing");
+
+        if (Message.HEARTBEAT.equals(msgType)) {
+            workerHeartbeat.put(request.studentId, System.currentTimeMillis());
+            return;
+        }
+
+        if (Message.RPC_REQUEST.equals(msgType)) {
+            rpcRequestQueue.offer(() -> processRpcPayload(request.payload));
+            reassignPendingRequests();
+            return;
+        }
+
+        if (Message.REGISTER_CAPABILITIES.equals(msgType)) {
+            workerHeartbeat.put(request.studentId, System.currentTimeMillis());
         }
     }
 
-    private void registerHeartbeat(String workerId) {
-        String normalized = (workerId == null || workerId.isEmpty()) ? "unknown" : workerId;
-        workerHeartbeat.put(normalized, System.currentTimeMillis());
+    private Message buildResponse(Message request) {
+        Message response = new Message();
+        response.studentId = studentId;
+
+        if (Message.RPC_REQUEST.equals(request.messageType)) {
+            response.messageType = Message.RPC_RESPONSE;
+            response.payload = "accepted";
+            return response;
+        }
+
+        response.messageType = Message.WORKER_ACK;
+        response.payload = "ack";
+        return response;
+    }
+
+    private void processRpcPayload(String payload) {
+        if (payload == null) {
+            retryCounter.incrementAndGet();
+        }
+    }
+
+    private void registerWorker(String workerId) {
+        String normalizedWorkerId = (workerId == null || workerId.isEmpty()) ? "unknown-worker" : workerId;
+        workerHeartbeat.put(normalizedWorkerId, System.currentTimeMillis());
     }
 
     public synchronized void reconcileState() {
@@ -204,49 +219,35 @@ public class Master {
         }
 
         for (String workerId : expiredWorkers) {
-            recoverWorker(workerId);
+            recoverAndReassign(workerId);
         }
     }
 
-    private void recoverWorker(String workerId) {
+    private void recoverAndReassign(String workerId) {
         workerHeartbeat.remove(workerId);
         retryCounter.incrementAndGet();
         reassignPendingRequests();
     }
 
     private void reassignPendingRequests() {
-        reassign(rpcRequestQueue);
-    }
-
-    private void reassign(BlockingQueue<Runnable> queue) {
         Runnable task;
-        while ((task = queue.poll()) != null) {
+        while ((task = rpcRequestQueue.poll()) != null) {
             systemThreads.submit(task);
         }
     }
 
-    public synchronized void shutdown() {
-        running = false;
-        ServerSocket socket = listenerSocket;
-        if (socket != null && !socket.isClosed()) {
-            try {
-                socket.close();
-            } catch (IOException ignored) {
+    private int computeRowValue(String operation, int[] row) {
+        if ("MATRIX_MULTIPLY".equals(operation) || "BLOCK_MULTIPLY".equals(operation)) {
+            int product = 1;
+            for (int value : row) {
+                product *= value;
             }
+            return product;
         }
-        listenerSocket = null;
-        systemThreads.shutdownNow();
-    }
-
-    public int getRetryCount() {
-        return retryCounter.get();
-    }
-
-    public int getCompletedTasks() {
-        return completedTasks.get();
-    }
-
-    public int getLastCoordinateValue() {
-        return lastCoordinateValue.get();
+        int sum = 0;
+        for (int value : row) {
+            sum += value;
+        }
+        return sum;
     }
 }
