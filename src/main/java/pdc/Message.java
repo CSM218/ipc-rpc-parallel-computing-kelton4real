@@ -8,6 +8,9 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 
 public class Message {
+    private static final int MAX_FIELD_BYTES = 64 * 1024;
+    private static final int MAX_PAYLOAD_BYTES = 8 * 1024 * 1024;
+
     public String magic;
     public int version;
     public String messageType;
@@ -28,11 +31,16 @@ public class Message {
         return pack();
     }
 
+    public static Message deserialize(byte[] data) {
+        return unpack(data);
+    }
+
     public byte[] pack() {
+        validateForPack();
         try {
-            byte[] magicBytes = magic == null ? new byte[0] : magic.getBytes(StandardCharsets.UTF_8);
-            byte[] typeBytes = messageType == null ? new byte[0] : messageType.getBytes(StandardCharsets.UTF_8);
-            byte[] studentBytes = studentId == null ? new byte[0] : studentId.getBytes(StandardCharsets.UTF_8);
+            byte[] magicBytes = magic.getBytes(StandardCharsets.UTF_8);
+            byte[] typeBytes = messageType.getBytes(StandardCharsets.UTF_8);
+            byte[] studentBytes = studentId.getBytes(StandardCharsets.UTF_8);
             byte[] payloadBytes = payload == null ? new byte[0] : payload;
 
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
@@ -57,47 +65,66 @@ public class Message {
     }
 
     public static Message unpack(byte[] data) {
-        if (data == null) {
-            throw new IllegalArgumentException("data cannot be null");
+        if (data == null || data.length == 0) {
+            throw new IllegalArgumentException("data cannot be null or empty");
         }
 
         try {
             DataInputStream in = new DataInputStream(new ByteArrayInputStream(data));
             Message message = new Message();
 
-            int magicLen = in.readInt();
-            byte[] magicBytes = new byte[Math.max(magicLen, 0)];
-            in.readFully(magicBytes);
-            message.magic = new String(magicBytes, StandardCharsets.UTF_8);
+            message.magic = new String(readBoundedField(in, MAX_FIELD_BYTES), StandardCharsets.UTF_8);
             message.version = in.readInt();
-
-            int typeLen = in.readInt();
-            byte[] typeBytes = new byte[Math.max(typeLen, 0)];
-            in.readFully(typeBytes);
-            message.messageType = new String(typeBytes, StandardCharsets.UTF_8);
-
-            int studentLen = in.readInt();
-            byte[] studentBytes = new byte[Math.max(studentLen, 0)];
-            in.readFully(studentBytes);
-            message.studentId = new String(studentBytes, StandardCharsets.UTF_8);
-
+            message.messageType = new String(readBoundedField(in, MAX_FIELD_BYTES), StandardCharsets.UTF_8);
+            message.studentId = new String(readBoundedField(in, MAX_FIELD_BYTES), StandardCharsets.UTF_8);
             message.timestamp = in.readLong();
+            message.payload = readBoundedField(in, MAX_PAYLOAD_BYTES);
 
-            int payloadLen = in.readInt();
-            byte[] payloadBytes = new byte[Math.max(payloadLen, 0)];
-            in.readFully(payloadBytes);
-            message.payload = payloadBytes;
-
-            if (!"CSM218".equals(message.magic)) {
-                throw new IllegalArgumentException("Invalid magic");
-            }
-            if (message.version < 1) {
-                throw new IllegalArgumentException("Invalid version");
-            }
-
+            message.validateForUse();
             return message;
         } catch (IOException e) {
             throw new IllegalArgumentException("Failed to unpack message", e);
+        }
+    }
+
+    private static byte[] readBoundedField(DataInputStream in, int maxLength) throws IOException {
+        int length = in.readInt();
+        if (length < 0 || length > maxLength) {
+            throw new IllegalArgumentException("Invalid field length: " + length);
+        }
+        byte[] bytes = new byte[length];
+        in.readFully(bytes);
+        return bytes;
+    }
+
+    private void validateForPack() {
+        if (magic == null || messageType == null || studentId == null) {
+            throw new IllegalArgumentException("Message fields cannot be null");
+        }
+        if (payload == null) {
+            payload = new byte[0];
+        }
+        validateForUse();
+    }
+
+    private void validateForUse() {
+        if (!"CSM218".equals(magic)) {
+            throw new IllegalArgumentException("Invalid magic");
+        }
+        if (version < 1) {
+            throw new IllegalArgumentException("Invalid version");
+        }
+        if (messageType.isEmpty()) {
+            throw new IllegalArgumentException("Invalid messageType");
+        }
+        if (studentId.isEmpty()) {
+            throw new IllegalArgumentException("Invalid studentId");
+        }
+        if (timestamp <= 0) {
+            throw new IllegalArgumentException("Invalid timestamp");
+        }
+        if (payload.length > MAX_PAYLOAD_BYTES) {
+            throw new IllegalArgumentException("Payload too large");
         }
     }
 }
